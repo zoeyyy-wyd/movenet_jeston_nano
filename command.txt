@@ -46,3 +46,13 @@ echo "PID: $!"
 
 # 看进度
 tail -f ~/build_cpu.log
+
+
+
+# 在 Nano 上简单验证
+from movenet.movenet_trt import MoveNetTRT
+import cv2
+m = MoveNetTRT('movenet/output/pose_fp16.engine')
+frame = cv2.imread('test.jpg')
+kp = m.infer(frame)
+print('score_max:', kp[:, 2].max())   # 应该 0.7+

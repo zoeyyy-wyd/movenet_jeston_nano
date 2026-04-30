@@ -1,10 +1,10 @@
 """
 movenet_trt.py
 ==============
-MoveNet TensorRT inference wrapper.
+MoveNet TensorRT inference wrapper for Jetson Nano deployment.
 
 Core API:
-    movenet = MoveNetTRT("movenet/output/pose.engine")
+    movenet = MoveNetTRT("movenet/output/pose_fp16.engine")
     keypoints = movenet.infer(frame)   # frame: BGR ndarray (H, W, 3)
                                         # keypoints: (17, 3) float32
 
@@ -13,6 +13,21 @@ Output contract:
     x, y    : pixel coordinates in the original frame
     score   : confidence in [0, 1]
     k order : COCO-17 (see KEYPOINT_NAMES)
+
+Preprocessing (MUST match fire717 training)
+-------------------------------------------
+fire717's TensorDatasetTest does:
+    BGR -> RGB -> resize(192, 192) -> astype(float32)
+And the model's Backbone.forward does `x = x/127.5 - 1` internally.
+
+So at inference time we must:
+    1. NO letterbox -- just direct (non-uniform) resize to 192x192
+    2. NO division by 255 -- model expects [0, 255] range as float32
+    3. Use independent x/y scale factors to map predicted coords back
+       to original frame size (since the resize was non-uniform).
+
+Doing letterbox or /255 yields broken keypoints (heatmap_max ~0.3 instead
+of ~0.8) and skeleton stuck in a fixed corner of the frame.
 """
 
 import numpy as np
@@ -43,11 +58,8 @@ class MoveNetTRT(object):
     """
     MoveNet TensorRT inference.
 
-    Design notes:
-        - Preprocess: letterbox resize + BGR->RGB + [0,1] normalize
-        - Output   : (17, 3) numpy, already mapped back to original-frame coords
-        - Decoupled from the downstream model: anyone who consumes (17, 3)
-          numpy arrays can use the output directly.
+    Preprocess: non-uniform resize + BGR->RGB + raw [0, 255] float32.
+    Output    : (17, 3) numpy, mapped back to original-frame coords.
     """
 
     REQUIRED_OUTPUTS = ['heatmap', 'center', 'regs', 'offsets']
@@ -105,33 +117,33 @@ class MoveNetTRT(object):
         for n, idx in self.output_idx.items():
             print("     output: {} {}".format(n, self.bindings_info[idx]['shape']))
 
-    # ---------- Preprocess ----------
+    # ---------- Preprocess (matches fire717 TensorDatasetTest) ----------
     def _preprocess(self, frame):
         """
-        BGR -> (1, 3, 192, 192) float32
+        BGR (H, W, 3) uint8 -> (1, 3, 192, 192) float32
 
         Steps:
-            1) letterbox resize, gray padding
-            2) BGR -> RGB (MoveNet was trained on RGB)
-            3) /255 normalize
+            1) BGR -> RGB
+            2) Direct resize to 192x192 (NON-uniform, no letterbox)
+            3) astype(float32), DO NOT divide by 255
+               (the backbone does x/127.5 - 1 internally)
             4) HWC -> CHW + batch dim
+
+        Returns the blob plus (scale_x, scale_y) so we can map predicted
+        coords back to the original frame.
         """
         h, w = frame.shape[:2]
-        scale = min(float(self.img_size) / h, float(self.img_size) / w)
-        new_h = int(round(h * scale))
-        new_w = int(round(w * scale))
-        pad_h = (self.img_size - new_h) // 2
-        pad_w = (self.img_size - new_w) // 2
 
-        resized = cv2.resize(frame, (new_w, new_h))
-        resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.img_size, self.img_size),
+                         interpolation=cv2.INTER_LINEAR)
 
-        canvas = np.full((self.img_size, self.img_size, 3), 128, dtype=np.uint8)
-        canvas[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = resized
+        blob = img.astype(np.float32)                      # KEEP [0, 255]
+        blob = np.transpose(blob, (2, 0, 1))[None]         # (1, 3, H, W)
 
-        blob = canvas.astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))[None]
-        return blob, scale, pad_w, pad_h
+        scale_x = float(w) / self.img_size
+        scale_y = float(h) / self.img_size
+        return blob, scale_x, scale_y
 
     # ---------- TRT forward ----------
     def _trt_forward(self, blob):
@@ -150,14 +162,14 @@ class MoveNetTRT(object):
         return {k: v.astype(np.float32) for k, v in outs.items()}
 
     # ---------- Postprocess ----------
-    def _postprocess(self, outs, scale, pad_w, pad_h):
+    def _postprocess(self, outs, scale_x, scale_y):
         """
         4-head decoder for fire717/movenet:
             1. argmax over center heatmap -> body center (cy, cx)
-            2. regs[k] regresses from center to keypoint k (on 48x48 feature map)
+            2. regs[k] regresses from center to keypoint k (on 48x48 grid)
             3. offsets refines sub-pixel position
             4. heatmap[k] gives confidence
-            5. invert letterbox to original-frame coords
+            5. independent x/y scaling to map back to original frame
         """
         heatmap = outs['heatmap']    # (1, 17, 48, 48)
         center  = outs['center']     # (1,  1, 48, 48)
@@ -184,8 +196,9 @@ class MoveNetTRT(object):
             x_in = (kx + ox) * stride
             y_in = (ky + oy) * stride
 
-            keypoints[k, 0] = (x_in - pad_w) / scale
-            keypoints[k, 1] = (y_in - pad_h) / scale
+            # Map back to original frame (non-uniform inverse of the resize)
+            keypoints[k, 0] = x_in * scale_x
+            keypoints[k, 1] = y_in * scale_y
             keypoints[k, 2] = float(heatmap[0, k, ky, kx])
         return keypoints
 
@@ -199,11 +212,11 @@ class MoveNetTRT(object):
         Returns
         -------
         keypoints : np.ndarray (17, 3) float32
-                    Each row is (x, y, score) with x/y in original-frame pixels.
+                    (x, y, score) with x/y in original-frame pixels.
         """
-        blob, scale, pad_w, pad_h = self._preprocess(frame)
+        blob, scale_x, scale_y = self._preprocess(frame)
         outs = self._trt_forward(blob)
-        return self._postprocess(outs, scale, pad_w, pad_h)
+        return self._postprocess(outs, scale_x, scale_y)
 
 
 # ---------- Visualization ----------
