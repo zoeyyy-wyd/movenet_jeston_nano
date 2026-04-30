@@ -1,0 +1,48 @@
+python3 build_dataset.py \
+    --data-root data_Le2i \
+    --onnx movenet/output/pose_raw.onnx \
+    --out-dir datasets
+
+    cd ~/movenet_jeston_nano
+python3 << 'EOF'
+import numpy as np
+from pathlib import Path
+
+# 找一个 npz 看看
+npz_files = list(Path('datasets/raw_keypoints').rglob('*.npz'))
+print(f'Total npz files: {len(npz_files)}')
+print(f'First 3:')
+for f in npz_files[:3]:
+    print(f'  {f}')
+
+# 打开第一个看结构
+data = np.load(npz_files[0])
+print(f'\n=== {npz_files[0].name} ===')
+print(f'Keys: {list(data.keys())}')
+for k in data.keys():
+    arr = data[k]
+    print(f'  {k}: shape={arr.shape}, dtype={arr.dtype}')
+EOF
+
+
+
+# 1. 清掉所有残留
+pkill -f build_dataset
+sleep 2
+
+# 2. 重新跑(注意 cd 在前)
+cd ~/movenet_jeston_nano/movenet
+CUDA_VISIBLE_DEVICES="" nohup python3 ../build_dataset.py > ../build.log 2>&1 &
+
+# 3. 看 log 确认起来了
+sleep 3
+tail -20 ../build.log
+
+
+
+
+nohup bash -c 'CUDA_VISIBLE_DEVICES="" python3 ../build_dataset.py' > ~/build_cpu.log 2>&1 &
+echo "PID: $!"
+
+# 看进度
+tail -f ~/build_cpu.log

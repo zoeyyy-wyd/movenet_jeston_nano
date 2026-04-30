@@ -4,43 +4,45 @@ fall_model.py
 Fall-detection GRU model + CSV-based dataset.
 
 Contains:
-    - FallDetectionGRU      : pure GRU classifier (input 51, output 2)
-    - FallKeypointCSVDataset: load keypoints from a CSV, slice into windows
+    - FallDetectionGRU       : pure GRU classifier (input 51, output 2)
+    - FallKeypointCSVDataset : load keypoints from a CSV, slice into windows,
+                               compute window-level labels by vote.
 
 Why a pure GRU (no attention):
-    - A fall is a very characteristic motion pattern; the final GRU hidden
-      state already summarizes the sequence well.
-    - Fewer parameters -> faster on Nano, less overfit risk on small datasets.
+    - A fall is a fairly characteristic motion pattern; the final GRU
+      hidden state already summarizes the sequence well.
+    - Fewer parameters -> faster on Nano, less overfit risk on small
+      datasets.
 
-CSV format expected:
-    Each row = one frame from one video. Columns:
-        video_id   : str/int, identifies which video the frame belongs to
-                     (the sliding window will NOT cross videos)
-        frame_idx  : int,   frame number within the video (used for ordering)
-        label      : int,   0 = normal, 1 = fall (same for every frame
-                     of a given video)
-        x0, y0, s0 : keypoint 0 (x, y, score)
-        x1, y1, s1 : keypoint 1
-        ...
-        x16, y16, s16
+CSV format expected (matches build_dataset.py's output)
+-------------------------------------------------------
+    Each row = ONE FRAME from one video. Columns (54 total):
+        video_id    : str, identifies which video the frame belongs to
+                      (the sliding window will NOT cross videos)
+        frame_idx   : int, frame number within the video (0-indexed)
+        label       : int, 0 = normal, 1 = fall  *** PER FRAME ***
+        nose_x, nose_y, nose_score, ..., right_ankle_x/y/score
+        (3 metadata + 17 * 3 = 54)
 
-    => 3 metadata columns + 17 * 3 = 51 keypoint columns = 54 total.
+    Note: the per-frame `label` is 1 only inside the [end, end+post_fall]
+    region of fall videos (see build_dataset.py); a single video usually
+    contains BOTH 0 and 1 frames, so we cannot collapse it to a single
+    video-level label.
 
-Example:
-    video_id,frame_idx,label,x0,y0,s0,x1,y1,s1,...,x16,y16,s16
-    fall_001,0,1,320.5,100.2,0.95,310.1,90.8,0.93,...
-    fall_001,1,1,321.0,102.5,0.94,...
-    fall_001,2,1,...
-    ...
-    normal_001,0,0,...
-    ...
+Window labeling
+---------------
+For each sliding window of length `seq_len`, we count how many frames
+inside the window have label==1. The window is labeled 1 iff that
+count >= `min_pos_frames`.
 
-Helper `dataframe_to_keypoint_dict` is provided so that you can convert
-NPZ-style data into the same in-memory format if you start from npz later.
+    min_pos_frames default = 5 (out of seq_len=30, i.e. ~17%)
+
+This catches windows that contain the post-impact moment without
+over-weighting brief noise.
 """
 
 import os
-from collections import Counter, defaultdict
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -49,6 +51,15 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 
 from features import KeypointFeatureExtractor, FEATURE_DIM
+
+
+# COCO-17 names, must match build_dataset.py / movenet_trt.py
+KEYPOINT_NAMES = [
+    'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+    'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+    'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
+]
 
 
 # =====================================================================
@@ -60,16 +71,6 @@ class FallDetectionGRU(nn.Module):
 
     Input  : (B, T, 51)
     Output : (B, 2)   logits for [normal, fall]
-
-    Usage:
-        model = FallDetectionGRU(input_dim=51, hidden_dim=64, num_layers=2)
-        logits = model(seq)
-        loss = F.cross_entropy(logits, labels)
-
-        # Inference
-        with torch.no_grad():
-            probs = torch.softmax(model(seq), 1)
-            fall_prob = probs[:, 1]
     """
 
     def __init__(self, input_dim=FEATURE_DIM, hidden_dim=64, num_layers=2,
@@ -80,7 +81,6 @@ class FallDetectionGRU(nn.Module):
         self.num_layers = num_layers
         self.num_classes = num_classes
 
-        # LayerNorm on input stabilizes features of different scales.
         self.input_norm = nn.LayerNorm(input_dim)
 
         self.gru = nn.GRU(
@@ -91,7 +91,6 @@ class FallDetectionGRU(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        # Use the last layer's final hidden state for classification.
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, 32),
             nn.ReLU(),
@@ -106,13 +105,10 @@ class FallDetectionGRU(nn.Module):
         """
         x = self.input_norm(x)
         out, h_n = self.gru(x)
-        # h_n : (num_layers, B, hidden_dim) -> take top layer
-        last = h_n[-1]
+        last = h_n[-1]   # (B, hidden_dim)
         return self.classifier(last)
 
-    # ---------- Save / load ----------
     def save(self, path, extra=None):
-        """Save weights + config so load_from() can reconstruct exactly."""
         ckpt = {
             'state_dict': self.state_dict(),
             'config': {
@@ -128,7 +124,6 @@ class FallDetectionGRU(nn.Module):
 
     @classmethod
     def load_from(cls, path, map_location='cpu'):
-        """Returns (model, ckpt_dict). ckpt_dict carries seq_len, val_acc, etc."""
         ckpt = torch.load(path, map_location=map_location)
         cfg = ckpt['config']
         model = cls(**cfg)
@@ -140,24 +135,26 @@ class FallDetectionGRU(nn.Module):
 
 
 # =====================================================================
-# CSV loading helpers
+# CSV loading: per-video (T, 17, 3) keypoints + per-frame labels
 # =====================================================================
 def _expected_keypoint_columns():
-    """Return the 51 expected keypoint column names: x0,y0,s0,x1,y1,s1,..."""
+    """The 51 keypoint column names in build_dataset.py order."""
     cols = []
-    for k in range(17):
-        cols.extend(['x{}'.format(k), 'y{}'.format(k), 's{}'.format(k)])
+    for name in KEYPOINT_NAMES:
+        cols.extend(['{}_x'.format(name),
+                     '{}_y'.format(name),
+                     '{}_score'.format(name)])
     return cols
 
 
 def load_csv_to_videos(csv_path, verbose=True):
     """
-    Read a CSV and return {video_id: (keypoints_array, label)}.
+    Read a per-frame CSV and return {video_id: (kp_arr, label_arr)}.
 
-    keypoints_array : np.ndarray (T, 17, 3) float32, sorted by frame_idx
-    label           : int
+    kp_arr    : np.ndarray (T, 17, 3) float32, sorted by frame_idx
+    label_arr : np.ndarray (T,)        int64,   per-frame labels
 
-    Validates required columns and label consistency within each video.
+    Validates required columns.
     """
     df = pd.read_csv(csv_path)
 
@@ -168,33 +165,35 @@ def load_csv_to_videos(csv_path, verbose=True):
     if missing:
         raise ValueError(
             "CSV is missing columns: {}\n"
-            "Expected columns: video_id, frame_idx, label, "
-            "x0..x16, y0..y16, s0..s16".format(sorted(missing))
+            "Expected: video_id, frame_idx, label, "
+            "nose_x..right_ankle_score (17 keypoints x 3)".format(
+                sorted(missing))
         )
 
     videos = {}
     for vid, group in df.groupby('video_id', sort=False):
-        # Sort by frame_idx so the sequence is in chronological order.
         group = group.sort_values('frame_idx')
 
-        labels = group['label'].unique()
-        if len(labels) != 1:
-            raise ValueError(
-                "video_id={} has inconsistent labels: {}".format(vid, labels))
-        label = int(labels[0])
-
-        # (T, 51) -> (T, 17, 3)
-        kp_flat = group[kp_cols].to_numpy(dtype=np.float32)
+        kp_flat = group[kp_cols].to_numpy(dtype=np.float32)   # (T, 51)
         T = kp_flat.shape[0]
         kp_arr = kp_flat.reshape(T, 17, 3)
 
-        videos[vid] = (kp_arr, label)
+        label_arr = group['label'].to_numpy(dtype=np.int64)   # (T,)
+        videos[vid] = (kp_arr, label_arr)
 
     if verbose:
-        n_normal = sum(1 for _, lbl in videos.values() if lbl == 0)
-        n_fall = sum(1 for _, lbl in videos.values() if lbl == 1)
-        print("[INFO] Loaded {} videos from {} ({} normal, {} fall)".format(
-            len(videos), csv_path, n_normal, n_fall))
+        n_total = len(videos)
+        n_with_fall = sum(1 for _, lbls in videos.values() if (lbls == 1).any())
+        n_pure_normal = n_total - n_with_fall
+        total_frames = sum(len(lbls) for _, lbls in videos.values())
+        total_fall_frames = sum(int((lbls == 1).sum())
+                                for _, lbls in videos.values())
+        print("[INFO] Loaded {} videos from {}".format(n_total, csv_path))
+        print("       videos with any fall frames : {}".format(n_with_fall))
+        print("       pure-normal videos          : {}".format(n_pure_normal))
+        print("       total frames                : {}".format(total_frames))
+        print("       fall frames                 : {} ({:.2f}%)".format(
+            total_fall_frames, 100 * total_fall_frames / max(total_frames, 1)))
     return videos
 
 
@@ -203,74 +202,103 @@ def load_csv_to_videos(csv_path, verbose=True):
 # =====================================================================
 class FallKeypointCSVDataset(Dataset):
     """
-    Fall-detection dataset loaded from a CSV file.
+    Sliding-window dataset built from a per-frame CSV.
 
-    Each row of the CSV is one frame; rows for the same video share a
-    `video_id`. The sliding window is applied per video so that windows
-    never cross video boundaries.
+    Pipeline per video:
+        1. Sort frames by frame_idx
+        2. Run KeypointFeatureExtractor over the whole video to produce
+           (T, 51) features.
+           The extractor is STATEFUL (speed depends on previous frame),
+           so it must be reset and run sequentially per video.
+        3. Slice into windows of seq_len with given stride.
+        4. For each window, count how many frames have label==1.
+           Window label = 1 iff count >= min_pos_frames, else 0.
 
-    Usage:
-        ds = FallKeypointCSVDataset("data/fall_keypoints.csv",
-                                    seq_len=30, stride=5)
-        loader = DataLoader(ds, batch_size=16, shuffle=True)
-        for seq, label in loader:
-            # seq:   (B, 30, 51) float32
-            # label: (B,) int64
-            ...
+    The min_pos_frames threshold is the key knob to tune:
+        - too low  -> windows that just clip the start of the post-fall
+                     region get labeled 1, but they don't really show
+                     the "stillness" signal yet -> noisy positives
+        - too high -> too few positive samples, training collapses
+
+    With seq_len=30 and post_fall_frames=50, default min_pos_frames=5
+    means "at least 5 of 30 frames inside the window are post-impact".
     """
 
-    def __init__(self, csv_path, seq_len=30, stride=5, verbose=True):
+    def __init__(self, csv_path, seq_len=30, stride=5,
+                 min_pos_frames=5,
+                 video_ids=None,
+                 verbose=True):
         """
         Parameters
         ----------
-        csv_path : path to the CSV file
-        seq_len  : window size in frames (30 ≈ 1 s at 30 fps)
-        stride   : window step. Smaller = more samples but more correlated.
+        csv_path       : path to the per-frame CSV
+        seq_len        : window size in frames (30 ≈ 1.2 s @ 25 fps)
+        stride         : window step
+        min_pos_frames : window labeling threshold (see class docstring)
+        video_ids      : optional list of video_ids to keep (for train/val
+                         split by video). If None, all videos are used.
+        verbose        : print loading stats
         """
         self.csv_path = csv_path
         self.seq_len = seq_len
         self.stride = stride
+        self.min_pos_frames = min_pos_frames
         self.feature_dim = FEATURE_DIM
-        self.samples = []   # list of (feature_seq (T, 51), label int)
+        self.samples = []   # list of (feature_seq (seq_len, 51), label)
 
-        self._load(verbose)
+        self._load(video_ids, verbose)
 
-    def _load(self, verbose):
+    def _load(self, video_ids, verbose):
         videos = load_csv_to_videos(self.csv_path, verbose=verbose)
+
+        if video_ids is not None:
+            wanted = set(video_ids)
+            videos = {k: v for k, v in videos.items() if k in wanted}
+            if verbose:
+                print("[INFO] Filtered to {} videos".format(len(videos)))
+
         ext = KeypointFeatureExtractor()
 
-        per_class_videos = Counter()
+        n_videos_used = 0
+        n_videos_skipped_short = 0
         per_class_samples = Counter()
 
-        for vid, (kp_arr, label) in videos.items():
+        for vid, (kp_arr, label_arr) in videos.items():
             T_total = kp_arr.shape[0]
             if T_total < self.seq_len:
-                if verbose:
-                    print("[WARN] {} too short ({} < seq_len={}), skipped".format(
-                        vid, T_total, self.seq_len))
+                n_videos_skipped_short += 1
                 continue
 
-            # Extract features for the whole video first
-            # (stateful: speed depends on the previous frame).
             feat_seq = ext.extract_sequence(kp_arr)   # (T, 51)
-
             T = feat_seq.shape[0]
-            n_added = 0
-            for s in range(0, T - self.seq_len + 1, self.stride):
-                self.samples.append((feat_seq[s:s + self.seq_len], label))
-                n_added += 1
 
-            per_class_videos[label] += 1
-            per_class_samples[label] += n_added
+            for s in range(0, T - self.seq_len + 1, self.stride):
+                e = s + self.seq_len
+                window_labels = label_arr[s:e]
+                pos_count = int((window_labels == 1).sum())
+                window_label = 1 if pos_count >= self.min_pos_frames else 0
+
+                self.samples.append(
+                    (feat_seq[s:e].astype(np.float32), window_label))
+                per_class_samples[window_label] += 1
+
+            n_videos_used += 1
 
         if verbose:
-            for label in sorted(per_class_videos):
-                cls_name = 'fall' if label == 1 else 'normal'
-                print("[INFO] {:6s} (label={}): {} videos -> {} samples".format(
-                    cls_name, label,
-                    per_class_videos[label],
-                    per_class_samples[label]))
-            print("[INFO] Total samples: {}".format(len(self.samples)))
+            print("[INFO] Windowed dataset built")
+            print("       seq_len={}, stride={}, min_pos_frames={}".format(
+                self.seq_len, self.stride, self.min_pos_frames))
+            print("       videos used    : {}".format(n_videos_used))
+            print("       videos skipped : {} (too short, < seq_len)".format(
+                n_videos_skipped_short))
+            print("       windows total  : {}".format(len(self.samples)))
+            for lbl in sorted(per_class_samples):
+                cls_name = 'fall  ' if lbl == 1 else 'normal'
+                print("       class {} ({}) : {} windows".format(
+                    lbl, cls_name, per_class_samples[lbl]))
+            if 0 in per_class_samples and 1 in per_class_samples:
+                ratio = per_class_samples[0] / max(per_class_samples[1], 1)
+                print("       imbalance (n:p): {:.1f}:1".format(ratio))
 
     def __len__(self):
         return len(self.samples)
@@ -283,5 +311,31 @@ class FallKeypointCSVDataset(Dataset):
         )
 
     def class_distribution(self):
-        """Return {label: number_of_samples}."""
         return dict(Counter(s[1] for s in self.samples))
+
+
+# =====================================================================
+# Helper: train/val video-level split (NO leakage of frames across splits)
+# =====================================================================
+def split_videos_by_id(csv_path, val_frac=0.2, seed=42):
+    """
+    Returns (train_video_ids, val_video_ids).
+
+    Splits at the VIDEO level: all frames from one video go to either
+    train or val, never both. Stratifies by 'video has any fall frame'
+    so both splits get a similar fall-video proportion.
+    """
+    df = pd.read_csv(csv_path, usecols=['video_id', 'label'])
+    per_video = df.groupby('video_id')['label'].max().reset_index()
+    per_video.columns = ['video_id', 'has_fall']
+
+    rng = np.random.default_rng(seed)
+    train_ids, val_ids = [], []
+    for has_fall, sub in per_video.groupby('has_fall'):
+        ids = sub['video_id'].tolist()
+        rng.shuffle(ids)
+        n_val = max(1, int(round(len(ids) * val_frac)))
+        val_ids.extend(ids[:n_val])
+        train_ids.extend(ids[n_val:])
+
+    return sorted(train_ids), sorted(val_ids)
